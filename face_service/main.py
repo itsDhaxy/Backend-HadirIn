@@ -2,17 +2,36 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import face_recognition as fr
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFile
 import numpy as np
 from pathlib import Path
 import io, os, time, re
 from typing import Dict, List, Tuple
+from pydantic import BaseModel
+
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except Exception:
+    pass
+
+# Optional fallback for wider image format support.
+try:
+    import imageio.v3 as iio
+    _HAS_IMAGEIO = True
+except Exception:
+    iio = None
+    _HAS_IMAGEIO = False
 
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+
+# Allow very large images and avoid truncated-image errors.
+Image.MAX_IMAGE_PIXELS = None
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # ===== Paths (absolute) =====
 BASE_DIR = Path(__file__).resolve().parent
@@ -47,14 +66,50 @@ def _resize_np(img_np: np.ndarray, max_w: int) -> Tuple[np.ndarray, float]:
     new_h = int(h * scale)
     pil = Image.fromarray(img_np)
     pil = pil.resize((new_w, new_h), Image.BILINEAR)
-    return np.array(pil), scale
+    return np.asarray(pil, dtype=np.uint8), scale
+
+def _normalize_uint8(img: np.ndarray) -> np.ndarray:
+    if img.dtype == np.uint8:
+        return img
+    img = img.astype(np.float32, copy=False)
+    if img.size == 0:
+        return np.zeros_like(img, dtype=np.uint8)
+    maxv = float(np.max(img))
+    if maxv <= 1.0:
+        img = img * 255.0
+    elif maxv > 255.0:
+        img = img * (255.0 / maxv)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+def _to_rgb_uint8(raw: bytes) -> np.ndarray:
+    try:
+        pil = Image.open(io.BytesIO(raw))
+        pil = ImageOps.exif_transpose(pil)
+        if pil.mode != "RGB":
+            pil = pil.convert("RGB")
+        img = np.asarray(pil)
+    except Exception:
+        if not _HAS_IMAGEIO:
+            raise
+        img = iio.imread(raw)
+
+    if img.ndim == 2:
+        img = np.stack([img, img, img], axis=-1)
+    elif img.ndim == 3 and img.shape[2] > 3:
+        img = img[:, :, :3]
+
+    img = _normalize_uint8(img)
+    return np.ascontiguousarray(img, dtype=np.uint8)
 
 def _encode_image_bytes(raw: bytes, jitters: int = 1):
-    pil = Image.open(io.BytesIO(raw))
-    pil = ImageOps.exif_transpose(pil).convert("RGB")
-    img = np.array(pil)
+    img = _to_rgb_uint8(raw)
     img, _ = _resize_np(img, MAX_WIDTH)
-    locs = fr.face_locations(img, model=MODEL, number_of_times_to_upsample=UPSAMPLE)
+    img = np.ascontiguousarray(img, dtype=np.uint8)
+    try:
+        locs = fr.face_locations(img, model=MODEL, number_of_times_to_upsample=UPSAMPLE)
+    except RuntimeError as e:
+        print(f"[ENCODE][ERROR] {e} dtype={img.dtype} shape={img.shape}")
+        raise
     if not locs:
         return None
     encs = fr.face_encodings(img, known_face_locations=[locs[0]], num_jitters=jitters)
@@ -124,6 +179,10 @@ def _best_match(cand: np.ndarray):
             second = dmin
     return best_name or "", best, second
 
+class DeleteEmbeddingsRequest(BaseModel):
+    name: str
+    delete_faces: bool = False
+
 # ---------- Endpoints ----------
 @app.get("/health")
 def health():
@@ -154,13 +213,49 @@ def reload_from_faces():
     load_embeddings()
     return {"success": True, "created": res.get("created", 0), "count": len(emb_by_person)}
 
+@app.post("/delete-embeddings")
+def delete_embeddings(payload: DeleteEmbeddingsRequest):
+    try:
+        person = _slug(payload.name)
+        deleted = 0
+
+        emb_dir = EMB_DIR / person
+        if emb_dir.exists():
+            for f in emb_dir.iterdir():
+                if f.is_file() and f.suffix.lower() == ".npy":
+                    f.unlink()
+                    deleted += 1
+            if not any(emb_dir.iterdir()):
+                emb_dir.rmdir()
+
+        if payload.delete_faces:
+            faces_dir = FACES_DIR / person
+            if faces_dir.exists():
+                for f in faces_dir.iterdir():
+                    if f.is_file():
+                        f.unlink()
+                if not any(faces_dir.iterdir()):
+                    faces_dir.rmdir()
+
+        load_embeddings()
+        return {"success": True, "person": person, "deleted": deleted}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
 # Enroll: terima foto → encode → simpan .npy
 @app.post("/enroll")
 async def enroll(name: str = Form(...), image: UploadFile = File(...)):
     raw = await image.read()
     if not raw:
         return {"success": False, "message": "Empty file"}
-    enc = _encode_image_bytes(raw, jitters=ENC_JITTERS)
+    try:
+        enc = _encode_image_bytes(raw, jitters=ENC_JITTERS)
+    except Exception as e:
+        msg = str(e)
+        print(f"[ENROLL][ERROR] {msg}")
+        if "Unsupported image type" in msg:
+            return {"success": False, "message": "Format gambar tidak didukung. Gunakan JPG/PNG 8-bit."}
+        return {"success": False, "message": f"Invalid image: {type(e).__name__}"}
     if enc is None:
         return {"success": False, "message": "No face found/encoded"}
 
@@ -179,7 +274,14 @@ async def _verify_core(upload: UploadFile):
     if not raw:
         return {"success": False, "message": "Empty file"}
 
-    enc = _encode_image_bytes(raw, jitters=1)  # verifikasi ringan
+    try:
+        enc = _encode_image_bytes(raw, jitters=1)  # verifikasi ringan
+    except Exception as e:
+        msg = str(e)
+        print(f"[VERIFY][ERROR] {msg}")
+        if "Unsupported image type" in msg:
+            return {"success": False, "message": "Format gambar tidak didukung. Gunakan JPG/PNG 8-bit."}
+        return {"success": False, "message": f"Invalid image: {type(e).__name__}"}
     if enc is None:
         return {"success": False, "message": "No face found/encoded"}
 
